@@ -1,149 +1,286 @@
-apiVersion: v1
-kind: Service
+apiVersion: apps/v1
+kind: StatefulSet
 metadata:
-  name: redis-master
-  labels:
-    app: redis
-    tier: backend
-    role: master
+  name: rabbitmq
 spec:
-  ports:
-  - port: 6379
-    targetPort: 6379
-  selector:
-    app: redis
-    tier: backend
-    role: master
----
-apiVersion: apps/v1 #  for k8s versions before 1.9.0 use apps/v1beta2  and before 1.8.0 use extensions/v1beta1
-kind: Deployment
-metadata:
-  name: redis-master
-spec:
-  selector:
-    matchLabels:
-      app: redis
-      role: master
-      tier: backend
+  serviceName: rabbitmq
   replicas: 1
-  template:
-    metadata:
-      labels:
-        app: redis
-        role: master
-        tier: backend
-    spec:
-      containers:
-      - name: master
-        image: registry.k8s.io/redis:e2e  # or just image: redis
-        resources:
-          requests:
-            cpu: 100m
-            memory: 100Mi
-        ports:
-        - containerPort: 6379
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: redis-replica
-  labels:
-    app: redis
-    tier: backend
-    role: replica
-spec:
-  ports:
-  - port: 6379
-  selector:
-    app: redis
-    tier: backend
-    role: replica
----
-apiVersion: apps/v1 #  for k8s versions before 1.9.0 use apps/v1beta2  and before 1.8.0 use extensions/v1beta1
-kind: Deployment
-metadata:
-  name: redis-replica
-spec:
   selector:
     matchLabels:
-      app: redis
-      role: replica
-      tier: backend
-  replicas: 2
+      app: rabbitmq
   template:
     metadata:
       labels:
-        app: redis
-        role: replica
-        tier: backend
+        app: rabbitmq
     spec:
+      nodeSelector:
+        "kubernetes.io/os": linux
       containers:
-      - name: replica
-        image: gcr.io/google_samples/gb-redisslave:v1
+      - name: rabbitmq
+        image: mifalowo.azurecr.io/rabbitmq/rabbitmq:latest
+        ports:
+        - containerPort: 5672
+          name: rabbitmq-amqp
+        - containerPort: 15672
+          name: rabbitmq-http
+        env:
+        - name: RABBITMQ_DEFAULT_USER
+          value: "username"
+        - name: RABBITMQ_DEFAULT_PASS
+          value: "password"
         resources:
           requests:
-            cpu: 100m
-            memory: 100Mi
-        env:
-        - name: GET_HOSTS_FROM
-          value: dns
-          # If your cluster config does not include a dns service, then to
-          # instead access an environment variable to find the master
-          # service's host, comment out the 'value: dns' line above, and
-          # uncomment the line below:
-          # value: env
-        ports:
-        - containerPort: 6379
+            cpu: 10m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 256Mi
+        volumeMounts:
+        - name: rabbitmq-enabled-plugins
+          mountPath: /etc/rabbitmq/enabled_plugins
+          subPath: enabled_plugins
+      volumes:
+      - name: rabbitmq-enabled-plugins
+        configMap:
+          name: rabbitmq-enabled-plugins
+          items:
+          - key: rabbitmq_enabled_plugins
+            path: enabled_plugins
+---
+apiVersion: v1
+data:
+  rabbitmq_enabled_plugins: |
+    [rabbitmq_management,rabbitmq_prometheus,rabbitmq_amqp1_0].
+kind: ConfigMap
+metadata:
+  name: rabbitmq-enabled-plugins            
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: frontend
-  labels:
-    app: guestbook
-    tier: frontend
+  name: rabbitmq
 spec:
-  # comment or delete the following line if you want to use a LoadBalancer
-  type: LoadBalancer
-  # if your cluster supports it, uncomment the following to automatically create
-  # an external load-balanced IP for the frontend service.
-  # type: LoadBalancer
+  selector:
+    app: rabbitmq
+  ports:
+    - name: rabbitmq-amqp
+      port: 5672
+      targetPort: 5672
+    - name: rabbitmq-http
+      port: 15672
+      targetPort: 15672
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+    spec:
+      nodeSelector:
+        "kubernetes.io/os": linux
+      containers:
+      - name: order-service
+        image: mifalowo.azurecr.io/aks-store-demo/order-service:latest
+        ports:
+        - containerPort: 3000
+        env:
+        - name: ORDER_QUEUE_HOSTNAME
+          value: "rabbitmq"
+        - name: ORDER_QUEUE_PORT
+          value: "5672"
+        - name: ORDER_QUEUE_USERNAME
+          value: "username"
+        - name: ORDER_QUEUE_PASSWORD
+          value: "password"
+        - name: ORDER_QUEUE_NAME
+          value: "orders"
+        - name: FASTIFY_ADDRESS
+          value: "0.0.0.0"
+        resources:
+          requests:
+            cpu: 1m
+            memory: 50Mi
+          limits:
+            cpu: 75m
+            memory: 128Mi
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          failureThreshold: 5
+          initialDelaySeconds: 20
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          failureThreshold: 3
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          failureThreshold: 5
+          initialDelaySeconds: 3
+          periodSeconds: 3
+      initContainers:
+      - name: wait-for-rabbitmq
+        image: busybox
+        command: ['sh', '-c', 'until nc -zv rabbitmq 5672; do echo waiting for rabbitmq; sleep 2; done;']
+        resources:
+          requests:
+            cpu: 1m
+            memory: 50Mi
+          limits:
+            cpu: 75m
+            memory: 128Mi    
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 3000
+    targetPort: 3000
+  selector:
+    app: order-service
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: product-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: product-service
+  template:
+    metadata:
+      labels:
+        app: product-service
+    spec:
+      nodeSelector:
+        "kubernetes.io/os": linux
+      containers:
+      - name: product-service
+        image: mifalowo.azurecr.io/aks-store-demo/product-service:latest
+        ports:
+        - containerPort: 3002
+        env: 
+        - name: AI_SERVICE_URL
+          value: "http://ai-service:5001/"
+        resources:
+          requests:
+            cpu: 1m
+            memory: 1Mi
+          limits:
+            cpu: 2m
+            memory: 20Mi
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3002
+          failureThreshold: 3
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3002
+          failureThreshold: 5
+          initialDelaySeconds: 3
+          periodSeconds: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: product-service
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 3002
+    targetPort: 3002
+  selector:
+    app: product-service
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: store-front
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: store-front
+  template:
+    metadata:
+      labels:
+        app: store-front
+    spec:
+      nodeSelector:
+        "kubernetes.io/os": linux
+      containers:
+      - name: store-front
+        image: mifalowo.azurecr.io/aks-store-demo/store-front:latest
+        ports:
+        - containerPort: 8080
+          name: store-front
+        env: 
+        - name: VUE_APP_ORDER_SERVICE_URL
+          value: "http://order-service:3000/"
+        - name: VUE_APP_PRODUCT_SERVICE_URL
+          value: "http://product-service:3002/"
+        resources:
+          requests:
+            cpu: 1m
+            memory: 200Mi
+          limits:
+            cpu: 1000m
+            memory: 512Mi
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          failureThreshold: 3
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          failureThreshold: 3
+          initialDelaySeconds: 3
+          periodSeconds: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          failureThreshold: 5
+          initialDelaySeconds: 3
+          periodSeconds: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: store-front
+spec:
   ports:
   - port: 80
+    targetPort: 8080
   selector:
-    app: guestbook
-    tier: frontend
----
-apiVersion: apps/v1 #  for k8s versions before 1.9.0 use apps/v1beta2  and before 1.8.0 use extensions/v1beta1
-kind: Deployment
-metadata:
-  name: frontend
-spec:
-  selector:
-    matchLabels:
-      app: guestbook
-      tier: frontend
-  replicas: 3
-  template:
-    metadata:
-      labels:
-        app: guestbook
-        tier: frontend
-    spec:
-      containers:
-      - name: php-redis
-        image: gcr.io/google-samples/gb-frontend:v4
-        resources:
-          requests:
-            cpu: 100m
-            memory: 100Mi
-        env:
-        - name: GET_HOSTS_FROM
-          #value: dns
-          # If your cluster config does not include a dns service, then to
-          # instead access environment variables to find service host
-          # info, comment out the 'value: dns' line above, and uncomment the
-          # line below:
-          value: env
-        ports:
-        - containerPort: 80
+    app: store-front
+  type: LoadBalancer
